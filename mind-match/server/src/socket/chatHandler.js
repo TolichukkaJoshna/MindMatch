@@ -4,18 +4,44 @@ import User from '../models/User.js';
 import { trackEvent } from '../services/analyticsService.js';
 
 export const setupChatHandlers = (io, socket) => {
+
+    // Get the actual user ID.
+    // Some socket authentication code may store:
+    // socket.userId = "64abc..."
+    //
+    // while other code may store:
+    // socket.userId = { userId: "64abc..." }
+    //
+    // This makes the chat handler work with both formats.
+    const getUserId = () => {
+        if (
+            socket.userId &&
+            typeof socket.userId === 'object' &&
+            socket.userId.userId
+        ) {
+            return socket.userId.userId;
+        }
+
+        return socket.userId;
+    };
+
     // Join conversation room
     socket.on('join-conversation', async (conversationId) => {
         try {
+            const userId = getUserId();
+
             // Verify user is part of conversation
             const conversation = await Conversation.findOne({
                 _id: conversationId,
-                participants: socket.userId,
+                participants: userId,
             });
 
             if (conversation) {
                 socket.join(`conversation:${conversationId}`);
-                console.log(`User ${socket.userId} joined conversation ${conversationId}`);
+
+                console.log(
+                    `User ${userId} joined conversation ${conversationId}`
+                );
             }
         } catch (error) {
             console.error('Error joining conversation:', error);
@@ -25,22 +51,33 @@ export const setupChatHandlers = (io, socket) => {
     // Send message
     socket.on('send-message', async (data) => {
         try {
-            const { conversationId, text, fileUrl, fileType, messageType, codeSnippet } = data;
+            const userId = getUserId();
+
+            const {
+                conversationId,
+                text,
+                fileUrl,
+                fileType,
+                messageType,
+                codeSnippet,
+            } = data;
 
             // Verify user is part of conversation
             const conversation = await Conversation.findOne({
                 _id: conversationId,
-                participants: socket.userId,
+                participants: userId,
             });
 
             if (!conversation) {
-                socket.emit('error', { message: 'Conversation not found' });
+                socket.emit('error', {
+                    message: 'Conversation not found',
+                });
                 return;
             }
 
             // Create message
             const message = await Message.create({
-                senderId: socket.userId,
+                senderId: userId,
                 conversationId,
                 text,
                 fileUrl,
@@ -48,7 +85,11 @@ export const setupChatHandlers = (io, socket) => {
                 messageType: messageType || 'text',
                 codeSnippet,
                 deliveryStatus: 'sent',
-                seenBy: [{ userId: socket.userId }],
+                seenBy: [
+                    {
+                        userId: userId,
+                    },
+                ],
             });
 
             await message.populate('senderId', 'name avatar');
@@ -58,47 +99,68 @@ export const setupChatHandlers = (io, socket) => {
             conversation.updatedAt = new Date();
 
             // Increment unread count for all participants except sender
-            await conversation.incrementUnread(socket.userId);
+            await conversation.incrementUnread(userId);
 
             // Broadcast to conversation room
             io.to(`conversation:${conversationId}`).emit('new-message', {
                 message,
             });
 
-            // Track event
-            await trackEvent('message_sent', socket.userId, { conversationId });
+            // Track analytics event
+            await trackEvent('message_sent', userId, {
+                conversationId,
+            });
+
         } catch (error) {
             console.error('Error sending message:', error);
-            socket.emit('error', { message: 'Failed to send message' });
+
+            socket.emit('error', {
+                message: 'Failed to send message',
+            });
         }
     });
 
     // Typing indicator
     socket.on('typing', (data) => {
-        const { conversationId, isTyping } = data;
-        socket.to(`conversation:${conversationId}`).emit('user-typing', {
-            userId: socket.userId,
-            isTyping,
-        });
+        try {
+            const userId = getUserId();
+
+            const { conversationId, isTyping } = data;
+
+            socket
+                .to(`conversation:${conversationId}`)
+                .emit('user-typing', {
+                    userId,
+                    isTyping,
+                });
+        } catch (error) {
+            console.error('Error handling typing event:', error);
+        }
     });
 
     // Mark messages as read
     socket.on('mark-read', async (data) => {
         try {
-            const { conversationId } = data;
-            console.log(`[Socket] mark-read event received from user ${socket.userId} for conversation ${conversationId}`);
+            const userId = getUserId();
 
-            // Update messages: add to seenBy and update delivery status
+            const { conversationId } = data;
+
+            console.log(
+                `[Socket] mark-read event received from user ${userId} for conversation ${conversationId}`
+            );
+
+            // Update messages:
+            // add user to seenBy and update delivery status
             const updateResult = await Message.updateMany(
                 {
                     conversationId,
-                    senderId: { $ne: socket.userId },
-                    'seenBy.userId': { $ne: socket.userId },
+                    senderId: { $ne: userId },
+                    'seenBy.userId': { $ne: userId },
                 },
                 {
                     $push: {
                         seenBy: {
-                            userId: socket.userId,
+                            userId: userId,
                             seenAt: new Date(),
                         },
                     },
@@ -107,61 +169,97 @@ export const setupChatHandlers = (io, socket) => {
                     },
                 }
             );
-            console.log(`[Socket] Updated ${updateResult.modifiedCount} messages as read`);
+
+            console.log(
+                `[Socket] Updated ${updateResult.modifiedCount} messages as read`
+            );
 
             // Reset unread count for this user
-            const conversation = await Conversation.findById(conversationId);
+            const conversation = await Conversation.findById(
+                conversationId
+            );
+
             if (conversation) {
-                console.log(`[Socket] Found conversation, resetting unread count...`);
-                await conversation.resetUnread(socket.userId);
-                console.log(`[Socket] Unread count reset complete`);
+                console.log(
+                    `[Socket] Found conversation, resetting unread count...`
+                );
+
+                await conversation.resetUnread(userId);
+
+                console.log(
+                    `[Socket] Unread count reset complete`
+                );
             } else {
-                console.log(`[Socket] ERROR: Conversation ${conversationId} not found!`);
+                console.log(
+                    `[Socket] ERROR: Conversation ${conversationId} not found!`
+                );
             }
 
-            // Notify ALL participants (including the user who marked as read)
-            // This ensures the conversation list updates for everyone
-            console.log(`[Socket] Emitting messages-read event to conversation room`);
-            io.to(`conversation:${conversationId}`).emit('messages-read', {
-                userId: socket.userId,
-                conversationId,
-            });
+            // Notify all participants
+            io.to(`conversation:${conversationId}`).emit(
+                'messages-read',
+                {
+                    userId,
+                    conversationId,
+                }
+            );
+
         } catch (error) {
-            console.error('[Socket] Error marking messages as read:', error);
+            console.error(
+                '[Socket] Error marking messages as read:',
+                error
+            );
         }
     });
 
     // Update online status
     socket.on('update-status', async (isOnline) => {
         try {
-            await User.findByIdAndUpdate(socket.userId, {
+            const userId = getUserId();
+
+            await User.findByIdAndUpdate(userId, {
                 isOnline,
                 lastActive: new Date(),
             });
 
             // Broadcast status update
             io.emit('user-status-changed', {
-                userId: socket.userId,
+                userId,
                 isOnline,
             });
+
         } catch (error) {
-            console.error('Error updating status:', error);
+            console.error(
+                'Error updating status:',
+                error
+            );
         }
     });
 
     // Handle conversation list refresh request
     socket.on('refresh-conversations', async () => {
         try {
+            const userId = getUserId();
+
             const conversations = await Conversation.find({
-                participants: socket.userId,
+                participants: userId,
             })
-                .populate('participants', 'name email avatar isOnline lastActive')
+                .populate(
+                    'participants',
+                    'name email avatar isOnline lastActive'
+                )
                 .populate('lastMessage')
                 .sort({ updatedAt: -1 });
 
-            socket.emit('conversations-updated', { conversations });
+            socket.emit('conversations-updated', {
+                conversations,
+            });
+
         } catch (error) {
-            console.error('Error refreshing conversations:', error);
+            console.error(
+                'Error refreshing conversations:',
+                error
+            );
         }
     });
 };

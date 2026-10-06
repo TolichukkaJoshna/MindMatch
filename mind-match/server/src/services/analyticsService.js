@@ -1,11 +1,36 @@
 import Analytics from '../models/Analytics.js';
 
+// Get the actual user ID whether userId is:
+// "64abc..."
+// or
+// { userId: "64abc..." }
+const normalizeUserId = (userId) => {
+    if (!userId) {
+        return null;
+    }
+
+    if (typeof userId === 'object' && userId.userId) {
+        return userId.userId;
+    }
+
+    return userId;
+};
+
 // Track an event
 export const trackEvent = async (eventType, userId, metadata = {}) => {
     try {
+        const normalizedUserId = normalizeUserId(userId);
+
+        if (!normalizedUserId) {
+            console.warn(
+                `[Analytics] Skipping event "${eventType}" because userId is missing`
+            );
+            return;
+        }
+
         await Analytics.create({
             eventType,
-            userId,
+            userId: normalizedUserId,
             metadata,
         });
     } catch (error) {
@@ -18,8 +43,12 @@ export const trackEvent = async (eventType, userId, metadata = {}) => {
 export const getAnalyticsSummary = async (startDate, endDate) => {
     try {
         const query = {};
+
         if (startDate && endDate) {
-            query.createdAt = { $gte: new Date(startDate), $lte: new Date(endDate) };
+            query.createdAt = {
+                $gte: new Date(startDate),
+                $lte: new Date(endDate),
+            };
         }
 
         const summary = await Analytics.aggregate([
